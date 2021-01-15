@@ -1,0 +1,55 @@
+defaults:
+  - callbacks: callbacks
+  - scheduler: cosinewarm
+  - optimizer: adamw
+
+general:
+  base_dir: ./
+  logs_dir: /wdata/lightning_logs/
+  seed: 13
+  num_workers: 4
+  gpu_list: [0, 1]
+  num_classes: 9
+  train_csv: /wdata/train_ground_truth_proc_5.csv
+  data_dir: ""
+  train_mels_pkl: /wdata/train_melspectrograms_nmels_${model.n_mels}_mono.pkl
+  leaky_validation: false
+
+model:
+  model_id: 1
+  architecture_name: resnet34
+  dropout: 0.3
+  input_size: [256, 448]
+  crop_method: crop
+  n_mels: 256
+
+training:
+  batch_size: 32
+  lr: 1e-5
+  augmentations: base
+  mixup: 0.
+  cutmix: 0.
+  max_epochs: 20
+  fold: 0
+  val_metric: val_roc_auc
+  metric_mode: max
+  pretrain_path: ""
+  balancing: false
+
+testing:
+  folds: [0, 1, 2, 3, 4]
+  test_data_dir: ""
+  mode: valid
+  n_slices: 2
+  test_mels_pkl: /wdata/test_melspectrograms_nmels_${model.n_mels}_mono.pkl
+  test_output_path: ""
+
+ensemble:
+  model_ids: [1, 2, 3]
+
+hydra:
+  run:
+    dir: ${general.base_dir}
+  sweep:
+    dir: ${general.base_dir}
+    subdir: ""
