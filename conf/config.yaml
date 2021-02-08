@@ -5,44 +5,45 @@ defaults:
 
 general:
   base_dir: ./
-  logs_dir: /wdata/lightning_logs/
+  logs_dir: /tmp/lightning_logs/
   seed: 13
   num_workers: 4
-  gpu_list: [0, 1]
-  num_classes: 9
-  train_csv: /wdata/train_ground_truth_proc_5.csv
-  data_dir: ""
-  train_mels_pkl: /wdata/train_melspectrograms_nmels_${model.n_mels}_mono.pkl
-  leaky_validation: false
+  gpu_list: [0]
+  num_classes: 1
+  train_csv: /tmp/training_proc.csv
+  data_dir: /data/input/train/
+  train_mels_pkl: /tmp/train_melspectrograms_nmels_${model.n_mels}.pkl
 
 model:
   model_id: 1
   architecture_name: resnet34
   dropout: 0.3
-  input_size: [256, 448]
+  input_size: [256, 512]
   crop_method: crop
   n_mels: 256
+  tabular_data: false
 
 training:
   batch_size: 32
-  lr: 1e-5
+  lr: 1e-4
   augmentations: base
   mixup: 0.
   cutmix: 0.
   max_epochs: 20
   fold: 0
-  val_metric: val_roc_auc
+  val_metric: val_rmse
   metric_mode: max
   pretrain_path: ""
   balancing: false
 
 testing:
   folds: [0, 1, 2, 3, 4]
-  test_data_dir: ""
+  test_data_dir: /data/input/pred/
+  test_csv: /data/input/pred/input_for_pred.csv
   mode: valid
-  n_slices: 2
-  test_mels_pkl: /wdata/test_melspectrograms_nmels_${model.n_mels}_mono.pkl
-  test_output_path: ""
+  n_slices: 0
+  test_mels_pkl: /tmp/test_melspectrograms_nmels_${model.n_mels}.pkl
+  test_output_path: /data/output/pred/result.csv
 
 ensemble:
   model_ids: [1, 2, 3]

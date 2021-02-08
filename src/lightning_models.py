@@ -4,8 +4,6 @@ import logging
 import os
 from argparse import Namespace
 
-import cnn_finetune
-import efficientnet_pytorch
 import hydra
 import numpy as np
 import omegaconf
@@ -25,6 +23,9 @@ from src import audio_processing
 from src import augmentations
 from src import dataset
 from src import utils
+import timm
+from sklearn import metrics
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class MixupOutput:
     lam: torch.Tensor
 
 
-class LitSoundscapesModel(pl.LightningModule):
+class LitTorqueModel(pl.LightningModule):
     """Custom LightningModule for Soundscapes competition."""
 
     def __init__(
@@ -53,64 +54,58 @@ class LitSoundscapesModel(pl.LightningModule):
             hydra_cfg: Hydra config with all the hyperparameters
         """
 
-        super(LitSoundscapesModel, self).__init__()
+        super(LitTorqueModel, self).__init__()
 
         self.cfg = hydra_cfg
 
-        if self.cfg.model.architecture_name.startswith("efficientnet"):
-            self.model = efficientnet_pytorch.EfficientNet.from_pretrained(
-                self.cfg.model.architecture_name,
-                num_classes=self.cfg.general.num_classes,
-            )
+        embedding_dimension = 512
+        
+        self.model = timm.create_model(
+            model_name=self.cfg.model.architecture_name,
+            pretrained=True,
+            num_classes=embedding_dimension if self.cfg.model.tabular_data else self.cfg.general.num_classes,
+            in_chans=3,
+            drop_rate=self.cfg.model.dropout,
+            global_pool="avg", # TODO: try different poolings catavgmax
+        )
+        
+        if self.cfg.model.tabular_data:
+            self.batchnorm = nn.BatchNorm1d(embedding_dimension + 6)
+            self.fc1 = nn.Linear(embedding_dimension + 6, embedding_dimension // 2)
+            self.dropout = nn.Dropout(0.2)
+            self.fc2 = nn.Linear(embedding_dimension // 2, 1)
 
-            self.model._avg_pooling = nn.AdaptiveAvgPool2d(1)
-            self.model._dropout = nn.Dropout(self.cfg.model.dropout)
-
-            mean = [0.485, 0.456, 0.406]
-            std = [0.229, 0.224, 0.225]
-        else:
-            self.model = cnn_finetune.make_model(
-                self.cfg.model.architecture_name,
-                num_classes=self.cfg.general.num_classes,
-                pretrained=True,
-                dropout_p=self.cfg.model.dropout,
-                pool=nn.AdaptiveAvgPool2d(1),
-                input_size=(self.cfg.model.input_size[0], self.cfg.model.input_size[1]),
-            )
-
-            mean = self.model.original_model_info.mean
-            std = self.model.original_model_info.std
+        mean = self.model.default_cfg.get("mean", (0, 0, 0))
+        std = self.model.default_cfg.get("std", (1, 1, 1))
 
         self.preprocess = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize(mean, std)]
         )
 
-        self.criterion = nn.CrossEntropyLoss(reduction="mean")
+        self.criterion = nn.MSELoss(reduction="mean")
+    def forward(self, img: torch.Tensor, tabular_data: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.model(img)
+        
+        if tabular_data is not None:
+            x = nn.functional.relu(x)
+            x = torch.cat((x, tabular_data), dim=1)
+            x = self.batchnorm(x)
+    #         x = nn.functional.relu(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        x = self.model(x)
+            x = self.fc1(x)
+            x = self.dropout(x)
+            x = nn.functional.relu(x)
+            x = self.fc2(x)
+        
         return x
 
     def setup(self, stage: str = "fit") -> None:
         """See base class."""
 
         train = pd.read_csv(self.cfg.general.train_csv)
-        train = utils.preprocess_df(train, data_dir=self.cfg.general.data_dir)
 
-        if os.path.exists(self.cfg.general.train_mels_pkl):
-            images = utils.load_from_file_fast(self.cfg.general.train_mels_pkl)
-            train["flac_path"] = train["audio_id"].map(images)
-        else:
-            images = audio_processing.flac_2_images(
-                audio_ids=train.audio_id.values,
-                flac_paths=train["flac_path"],
-                txt_paths=train["txt_path"],
-                remove_speech=True,
-                n_mels=self.cfg.model.n_mels,
-            )
-            utils.save_in_file_fast(images, self.cfg.general.train_mels_pkl)
-            train["flac_path"] = train["audio_id"].map(images)
+        images = utils.load_from_file_fast(self.cfg.general.train_mels_pkl)
+        train["flac_path"] = train["filename"].map(images)
 
         self.df_train = train[train.fold != self.cfg.training.fold].reset_index(
             drop=True
@@ -123,19 +118,6 @@ class LitSoundscapesModel(pl.LightningModule):
             f"Length of the train: {len(self.df_train)}. Length of the validation: {len(self.df_valid)}"
         )
 
-    def make_weights_for_balanced_classes(self, labels):
-        count = [0] * self.cfg.general.num_classes
-        for item in labels:
-            count[item] += 1
-        weight_per_class = [0.0] * self.cfg.general.num_classes
-        N = float(sum(count))
-        for i in range(self.cfg.general.num_classes):
-            weight_per_class[i] = N / float(count[i])
-        weight = [0] * len(labels)
-        for idx, val in enumerate(labels):
-            weight[idx] = weight_per_class[val]
-        return weight
-
     def train_dataloader(self) -> torch_data.DataLoader:
         """See base class."""
 
@@ -143,32 +125,22 @@ class LitSoundscapesModel(pl.LightningModule):
             *self.cfg.model.input_size
         )
 
-        if self.cfg.training.balancing:
-            # For unbalanced dataset we create a weighted sampler
-            weights = self.make_weights_for_balanced_classes(self.df_train.label.values)
-            weights = torch.DoubleTensor(weights)
-            sampler = torch.utils.data.sampler.WeightedRandomSampler(
-                weights, len(weights)
-            )
-        else:
-            sampler = None
-
-        train_dataset = dataset.SoundscapesDataset(
+        train_dataset = dataset.TorqueDataset(
             audios=self.df_train.flac_path.values,
-            labels=self.df_train.label.values,
+            labels=self.df_train,
             preprocess_function=self.preprocess,
             augmentations=augs,
             input_shape=(self.cfg.model.input_size[0], self.cfg.model.input_size[1], 3),
             crop_method=self.cfg.model.crop_method,
+            tabular_data=self.cfg.model.tabular_data,
         )
 
         train_loader = torch_data.DataLoader(
             train_dataset,
             batch_size=self.cfg.training.batch_size,
             num_workers=self.cfg.general.num_workers,
-            shuffle=False if sampler else True,
+            shuffle=True,
             pin_memory=True,
-            sampler=sampler,
         )
         return train_loader
 
@@ -177,14 +149,15 @@ class LitSoundscapesModel(pl.LightningModule):
     ) -> Union[torch_data.DataLoader, List[torch_data.DataLoader]]:
         """See base class."""
 
-        valid_dataset = dataset.SoundscapesDataset(
+        valid_dataset = dataset.TorqueDataset(
             audios=self.df_valid.flac_path.values,
-            labels=self.df_valid.label.values,
+            labels=self.df_valid,
             preprocess_function=self.preprocess,
             augmentations=None,
             input_shape=(self.cfg.model.input_size[0], self.cfg.model.input_size[1], 3),
             crop_method=self.cfg.model.crop_method,
             is_validation=True,
+            tabular_data=self.cfg.model.tabular_data,
         )
 
         valid_loader = torch_data.DataLoader(
@@ -368,6 +341,8 @@ class LitSoundscapesModel(pl.LightningModule):
 
         images = batch["image"]
         labels = batch["label"]
+        
+        tabular_data = batch["tabular_data"] if self.cfg.model.tabular_data else None
 
         if mixup:
             mixup_output = self.mixup(
@@ -382,8 +357,8 @@ class LitSoundscapesModel(pl.LightningModule):
             preds = self(cutmix_output.data)
             loss = self.mixup_cutmix_criterion(preds=preds, mixup_output=cutmix_output)
         else:
-            preds = self(images)
-            loss = self.criterion(preds, labels)
+            preds = self(images, tabular_data)
+            loss = self.criterion(preds.view(-1), labels)
 
         return preds, loss
 
@@ -407,7 +382,6 @@ class LitSoundscapesModel(pl.LightningModule):
         """See base class."""
 
         preds, loss = self._model_step(batch)
-        preds = torch.softmax(preds, dim=1)
 
         return {"preds": preds, "step_val_loss": loss}
 
@@ -417,52 +391,28 @@ class LitSoundscapesModel(pl.LightningModule):
         """See base class."""
 
         preds = np.vstack([x["preds"].cpu().detach().numpy() for x in outputs])
-        avg_loss = torch.cat([x["step_val_loss"] for x in outputs]).mean().item()
+        try:
+            avg_loss = torch.cat([x["step_val_loss"] for x in outputs]).mean().item()
+        except:
+            avg_loss = 0
 
-        labels = self.df_valid.label.values
-
+        labels = self.df_valid.tightening_result_torque.values
+        
         if len(labels) == len(preds):
-            if self.cfg.training.balancing:
-                probs = dict(zip(self.df_valid.audio_id.values, preds))
-                max_obs_per_class = self.df_valid.label.value_counts().values[0]
-                balanced_test = []
-
-                for label in self.df_valid.label.unique():
-                    test_single_label = self.df_valid[
-                        self.df_valid.label == label
-                    ].copy()
-                    np.random.seed(self.cfg.general.seed)
-                    test_single_label = test_single_label.sample(
-                        n=max_obs_per_class - len(test_single_label),
-                        replace=True,
-                        random_state=13,
-                    )
-                    balanced_test.append(test_single_label)
-
-                test = pd.concat([self.df_valid] + balanced_test)
-                labels = test.label.values
-                preds = [probs[x] for x in test.audio_id.values]
-
-            roc_auc = metrics.roc_auc_score(
-                y_true=labels,
-                y_score=preds,
-                average="macro",
-                labels=list(range(self.cfg.general.num_classes)),
-                multi_class="ovr",
-            )
-            roc_auc *= 100
+            rmse = 100 - metrics.mean_squared_error(labels, preds, squared=False)
         else:
-            roc_auc = 0
+            rmse = 0
+        
 
         tensorboard_logs = {
             "val_loss": avg_loss,
-            "val_roc_auc": roc_auc,
+            "val_rmse": rmse,
             "step": self.current_epoch,
         }
 
         return {
             "val_loss": avg_loss,
-            "val_roc_auc": roc_auc,
+            "val_rmse": rmse,
             "log": tensorboard_logs,
             "progress_bar": tensorboard_logs,
         }

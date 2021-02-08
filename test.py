@@ -21,6 +21,7 @@ from src import audio_processing
 from src import dataset
 from src import lightning_models
 from src import utils
+from sklearn import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -32,38 +33,13 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
     if cfg.testing.mode == "valid":
         test = pd.read_csv(cfg.general.train_csv)
         test = utils.preprocess_df(test, data_dir=cfg.general.data_dir)
-
-        if os.path.exists(cfg.general.train_mels_pkl):
-            images = utils.load_from_file_fast(cfg.general.train_mels_pkl)
-            test["flac_path"] = test["audio_id"].map(images)
-        else:
-            images = audio_processing.flac_2_images(
-                audio_ids=test.audio_id.values,
-                flac_paths=test["flac_path"],
-                txt_paths=test["txt_path"],
-                remove_speech=True,
-                n_mels=cfg.model.n_mels,
-            )
-            utils.save_in_file_fast(images, cfg.general.train_mels_pkl)
-            test["flac_path"] = test["audio_id"].map(images)
-
+        images = utils.load_from_file_fast(cfg.general.train_mels_pkl)
+        test["flac_path"] = test["filename"].map(images)
     else:
-        if os.path.exists(cfg.testing.test_mels_pkl):
-            test = utils.load_from_file_fast(cfg.testing.test_mels_pkl)
-        else:
-            test_flac_paths = glob.glob(
-                os.path.join(cfg.testing.test_data_dir, "*.flac")
-            )
-            audio_ids = [os.path.split(x)[-1][:-5] for x in test_flac_paths]
-            test = audio_processing.flac_2_images(
-                audio_ids=audio_ids,
-                flac_paths=test_flac_paths,
-                remove_speech=False,
-                n_mels=cfg.model.n_mels,
-            )
-            utils.save_in_file_fast(test, cfg.testing.test_mels_pkl)
-
-        test = pd.DataFrame(test.items(), columns=["audio_id", "flac_path"])
+        test = pd.read_csv(cfg.testing.test_csv)
+        test = utils.preprocess_df(test, data_dir=cfg.testing.test_data_dir)
+        images = utils.load_from_file_fast(cfg.testing.test_mels_pkl)
+        test["flac_path"] = test["filename"].map(images)
 
     logger.info(f"Length of the test data: {len(test)}")
 
@@ -83,26 +59,27 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
             )
         )
         fold_predictions = np.zeros(
-            (len(df_test), cfg.general.num_classes, len(checkpoints))
+            (len(df_test), len(checkpoints))
         )
 
         for checkpoint_id, checkpoint_path in enumerate(checkpoints):
-            model = lightning_models.LitSoundscapesModel.load_from_checkpoint(
+            model = lightning_models.LitTorqueModel.load_from_checkpoint(
                 checkpoint_path, hydra_cfg=cfg
             )
             model.eval().to(device)
 
             if cfg.testing.n_slices == 0:
-                test_dataset = dataset.SoundscapesDataset(
+                test_dataset = dataset.TorqueDataset(
                     audios=df_test.flac_path.values,
-                    labels=None,
+                    labels=df_test if cfg.model.tabular_data else None,
                     preprocess_function=model.preprocess,
                     augmentations=None,
                     input_shape=(cfg.model.input_size[0], cfg.model.input_size[1], 3),
                     crop_method=cfg.model.crop_method,
+                    tabular_data=cfg.model.tabular_data,
                 )
             else:
-                test_dataset = dataset.TestSoundscapesDataset(
+                test_dataset = dataset.TestTorqueDataset(
                     audios=df_test.flac_path.values,
                     preprocess_function=model.preprocess,
                     input_shape=(cfg.model.input_size[0], cfg.model.input_size[1], 3),
@@ -129,9 +106,13 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
                     else:
                         images = torch.cat(data["images"])
                     images = images.to(device)
-
-                    preds = model(images)
-                    preds = torch.softmax(preds, dim=1)
+                    
+                    if cfg.model.tabular_data:
+                        tabular_data = data["tabular_data"].to(device)
+                        preds = model(images, tabular_data).view(-1)
+                    else:
+                        preds = model(images).view(-1)
+                    
                     preds = preds.cpu().detach().numpy()
                     if cfg.testing.n_slices > 0:
                         preds = np.mean(preds, axis=0)
@@ -140,7 +121,6 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
                         idx
                         * cfg.training.batch_size : (idx + 1)
                         * cfg.training.batch_size,
-                        :,
                         checkpoint_id,
                     ] = preds
 
@@ -156,7 +136,7 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
 
     if cfg.testing.mode == "valid":
         test = pd.concat(df_list)
-        probs = np.vstack(pred_list)
+        probs = np.hstack(pred_list)
         if cfg.testing.n_slices == 0:
             filename = "validation_probs_single.pkl"
         else:
@@ -169,7 +149,7 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
         else:
             filename = "test_probs_sequential.pkl"
 
-    ensemble_probs = dict(zip(test.audio_id.values, probs))
+    ensemble_probs = dict(zip(test.filename.values, probs))
     utils.save_in_file_fast(
         ensemble_probs,
         file_name=os.path.join(
@@ -177,22 +157,14 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
         ),
     )
 
-    prob_cols = [f"prob_{x}" for x in range(cfg.general.num_classes)]
-
     if cfg.testing.mode == "valid":
+        labels = test.tightening_result_torque.values
+        rmse = 100 - metrics.mean_squared_error(labels, probs, squared=False)
 
-        scores = utils.get_scoring_metric(test, probs, balanced=False)
-        logger.info("Scores by fold: {}".format(scores))
-        score = np.mean(scores) * 100
-
-        bal_scores = utils.get_scoring_metric(test, ensemble_probs, balanced=True)
-        bal_score = np.mean(bal_scores) * 100
-
-        logger.info(f"OOF VALIDATION SCORE: {score:.4f}, bal: {bal_score:.4f}")
+        logger.info(f"OOF VALIDATION SCORE: {rmse:.4f}")
 
     else:
-        test = pd.DataFrame(ensemble_probs.items(), columns=["audio_id", "probs"])
-        test[prob_cols] = pd.DataFrame(test.probs.tolist(), index=test.index)
+        test = pd.DataFrame(ensemble_probs.items(), columns=["filename", "result"])
 
         if cfg.testing.n_slices == 0:
             fname = "solution_single.csv"
@@ -203,11 +175,11 @@ def run_model(cfg: omegaconf.DictConfig) -> None:
             cfg.general.logs_dir, f"model_{cfg.model.model_id}", fname
         )
         logger.info(f"Saving test predictions to {save_path}")
-        test[["audio_id"] + prob_cols].to_csv(save_path, header=False, index=False)
+        test[["filename", "result"]].to_csv(save_path, index=False)
 
         if cfg.testing.test_output_path != "":
-            test[["audio_id"] + prob_cols].to_csv(
-                cfg.testing.test_output_path, header=False, index=False
+            test[["filename", "result"]].to_csv(
+                cfg.testing.test_output_path, index=False
             )
 
 

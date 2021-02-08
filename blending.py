@@ -7,6 +7,7 @@ import hydra
 import numpy as np
 import omegaconf
 import pandas as pd
+from sklearn import metrics
 
 from src import utils
 
@@ -19,29 +20,17 @@ def make_ensemble(cfg: omegaconf.DictConfig) -> None:
 
     if cfg.testing.mode == "valid":
         train = pd.read_csv(cfg.general.train_csv)
-        train = utils.preprocess_df(train, data_dir=cfg.general.data_dir)
 
         predictions = utils.combine_predictions(
             models_list=cfg.ensemble.model_ids,
             logs_dir=cfg.general.logs_dir,
             mode=cfg.testing.mode,
         )
-        predictions = predictions.merge(train, on="audio_id")
+        predictions = predictions.merge(train, on="filename")
 
-        scores = utils.get_scoring_metric(
-            predictions, predictions.iloc[:, 1:10], balanced=False
-        )
-        logger.info("Scores by fold: {}".format(scores))
-        score = np.mean(scores) * 100
+        rmse = 100 - metrics.mean_squared_error(predictions.tightening_result_torque.values, predictions.result.values, squared=False)
 
-        bal_scores = utils.get_scoring_metric(
-            predictions,
-            dict(zip(predictions.audio_id.values, predictions.iloc[:, 1:10].values)),
-            balanced=True,
-        )
-        bal_score = np.mean(bal_scores) * 100
-
-        logger.info(f"OOF VALIDATION SCORE: {score:.4f}, bal: {bal_score:.4f}")
+        logger.info(f"OOF VALIDATION SCORE: {rmse:.4f}")
 
     else:
         test_to_write = utils.combine_predictions(
@@ -57,14 +46,11 @@ def make_ensemble(cfg: omegaconf.DictConfig) -> None:
 
         logger.info(f"Saving test predictions to {save_path}")
 
-        prob_cols = [f"prob_{x}" for x in range(9)]
-        test_to_write[["audio_id"] + prob_cols].to_csv(
-            save_path, header=False, index=False
-        )
+        test_to_write[["filename", "result"]].to_csv(save_path, index=False)
 
         if cfg.testing.test_output_path != "":
-            test_to_write[["audio_id"] + prob_cols].to_csv(
-                cfg.testing.test_output_path, header=False, index=False
+            test_to_write[["filename", "result"]].to_csv(
+                cfg.testing.test_output_path, index=False
             )
 
 

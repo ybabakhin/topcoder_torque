@@ -1,5 +1,6 @@
-import albumentations as albu
 from typing import Callable, Optional, List
+
+import albumentations as albu
 
 
 def base(input_h: int, input_w: int) -> albu.Compose:
@@ -28,7 +29,16 @@ def spec_augment(input_h: int, input_w: int) -> albu.Compose:
                 min_height=input_h // 16,
                 min_width=input_w,
                 p=0.5,
-            )
+            ),
+            albu.CoarseDropout(
+                max_holes=2,
+                max_height=input_h,
+                max_width=input_w // 8,
+                min_holes=1,
+                min_height=input_h,
+                min_width=input_w // 16,
+                p=0.5,
+            ),
         ],
         p=1,
     )
@@ -50,15 +60,24 @@ def hard(input_h: int, input_w: int) -> albu.Compose:
         [
             albu.CoarseDropout(
                 max_holes=2,
-                max_height=input_h // 8,
+                max_height=input_h // 4,
                 max_width=input_w,
                 min_holes=1,
-                min_height=input_h // 16,
+                min_height=input_h // 8,
                 min_width=input_w,
-                p=0.3,
+                p=0.7,
             ),
-            albu.ColorJitter(p=0.3),
-            albu.GaussNoise(p=0.3),
+            albu.CoarseDropout(
+                max_holes=2,
+                max_height=input_h,
+                max_width=input_w // 4,
+                min_holes=1,
+                min_height=input_h,
+                min_width=input_w // 8,
+                p=0.7,
+            ),
+            albu.GaussNoise(p=0.7),
+            albu.ColorJitter(p=0.7),
         ],
         p=1,
     )

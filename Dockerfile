@@ -10,9 +10,9 @@ RUN apt-get update && \
 
 RUN apt-get install -y libsndfile1 libgl1-mesa-glx wget curl unzip
 
-RUN mkdir /work
-COPY . /work
-WORKDIR /work
+RUN mkdir /code
+COPY ./ /code
+WORKDIR /code
 
 ENV LC_ALL C.UTF-8
 ENV LANG C.UTF-8
@@ -20,7 +20,14 @@ ENV LANG C.UTF-8
 RUN pip install pipenv==2020.11.15
 RUN pipenv sync
 
-RUN chmod +x test.sh
-RUN chmod +x train.sh
+WORKDIR /
 
-ENV TORCH_HOME="/wdata/pretrained_models/"
+RUN chmod +x /code/train.sh
+RUN chmod +x /code/pred.sh
+
+ENV TORCH_HOME="/code/pretrained_models/"
+ENV PIPENV_PIPFILE="/code/Pipfile"
+
+RUN mkdir -p /code/pretrained_models/checkpoints
+RUN wget https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/tf_efficientnet_b1_ns-99dd0c41.pth
+RUN wget https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/resnet18d_ra2-48a79e06.pth -P /code/pretrained_models/checkpoints/

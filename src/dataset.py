@@ -4,10 +4,11 @@ import numpy as np
 import torch
 from torch.utils import data as torch_data
 from typing import Tuple, Dict, Optional, Callable, Any, Sequence
+import pandas as pd
 
 
-class SoundscapesDataset(torch_data.Dataset):
-    """Custom dataset for Topcoder Soundscapes competition."""
+class TorqueDataset(torch_data.Dataset):
+    """Custom dataset for Topcoder Torque competition."""
 
     def __init__(
         self,
@@ -18,6 +19,7 @@ class SoundscapesDataset(torch_data.Dataset):
         input_shape: Tuple[int, int, int] = (128, 128, 3),
         crop_method: str = "resize",
         is_validation: bool = False,
+        tabular_data: bool = False,
     ) -> None:
         """
         Args:
@@ -30,6 +32,7 @@ class SoundscapesDataset(torch_data.Dataset):
                 - 'resize' corresponds to resizing the image to the input shape
                 - 'crop' corresponds to random cropping from the given image
             is_validation: flag whether it's a validation dataset
+            tabular_data: falg whether to use additional tabular data
         """
 
         self.audios = audios
@@ -39,6 +42,7 @@ class SoundscapesDataset(torch_data.Dataset):
         self.input_shape = input_shape
         self.crop_method = crop_method
         self.is_validation = is_validation
+        self.tabular_data = tabular_data
 
     def __len__(self) -> int:
         return len(self.audios)
@@ -46,11 +50,19 @@ class SoundscapesDataset(torch_data.Dataset):
     def __getitem__(self, audio_index: int) -> Dict[str, Any]:
         sample = dict()
 
-        sample["image"] = self.audios[audio_index]
+        ch0 = self.audios[audio_index]
+        sample["image"] = np.stack([ch0] * 3, axis=-1)
 
         if self.labels is not None:
-            sample["label"] = self.labels[audio_index]
+            sample["label"] = self.labels.tightening_result_torque.values[audio_index]
+            
+            if self.tabular_data:
+                features = pd.get_dummies(self.labels["junction_type"], prefix="junction_type")
+                features["device_id"] = self.labels["device_id"] - 2
+                features["is_flange"] = self.labels["is_flange"]
 
+                sample["tabular_data"] = features.values[audio_index].astype(np.float32)
+            
         if self.crop_method is not None:
             sample = self._crop_data(sample)
 
@@ -115,8 +127,8 @@ class SoundscapesDataset(torch_data.Dataset):
         return sample
 
 
-class TestSoundscapesDataset(torch_data.Dataset):
-    """Custom Test dataset for Topcoder Soundscapes competition."""
+class TestTorqueDataset(torch_data.Dataset):
+    """Custom Test dataset for Topcoder Torque competition."""
 
     def __init__(
         self,
@@ -146,14 +158,15 @@ class TestSoundscapesDataset(torch_data.Dataset):
         return len(self.audios)
 
     def __getitem__(self, audio_index: int) -> Dict[str, Any]:
-        whole_audio_image = self.audios[audio_index]
+        ch0 = self.audios[audio_index]
+        whole_audio_image = np.stack([ch0] * 3, axis=-1)
         whole_img_w = whole_audio_image.shape[1]
         crop_img_w = self.input_shape[1]
         step = crop_img_w
 
         images = []
         starts = list(np.arange(0, whole_img_w, step // self.n_slices))
-        starts.append(whole_img_w - crop_img_w)
+        starts.append(max(0, whole_img_w - crop_img_w))
 
         for start in starts:
             img = whole_audio_image[:, start : start + crop_img_w]
